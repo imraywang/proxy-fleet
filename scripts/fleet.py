@@ -21,6 +21,33 @@ CONFIG_PATH = SKILL_DIR / "config.json"
 EXAMPLE_CONFIG_PATH = SKILL_DIR / "config.example.json"
 RULES_DIR = SKILL_DIR / "templates" / "rules"
 
+# Rule sets we mirror onto our own subscription host and reference from the
+# generated config. (local_name, behavior, upstream_path, local_filename).
+#
+# These are MetaCubeX's pre-compiled `.mrs` geosite/geoip sets, NOT Loyalsoldier
+# text lists. Why .mrs: the text lists parse into large in-memory domain tries
+# (reject.txt alone was 4.7 MB → tens of MB resident) and OOM'd the iOS network
+# extension — the full config cold-started the mihomo core fine but the tunnel
+# was jetsam-killed on load (秒关). .mrs is a compiled succinct structure: the
+# same coverage in ~600 KB total, a fraction of the memory. Behavior is domain
+# or ipcidr only (mrs can't express `classical`, so Loyalsoldier's applications
+# list is dropped — those apps just get proxied, correct for whitelist mode).
+#
+# The mirror (see cmd_sync) fetches these on the VPS — which reaches GitHub/
+# jsdelivr fine — and drops them next to config.yaml, so clients only ever pull
+# rulesets from our own reachable origin (jsdelivr is poisoned in China).
+RULE_PROVIDERS = [
+    ("ads",        "domain", "geosite/category-ads-all.mrs", "ads.mrs"),
+    ("private",    "domain", "geosite/private.mrs",          "private.mrs"),
+    ("apple",      "domain", "geosite/apple.mrs",            "apple.mrs"),
+    ("icloud",     "domain", "geosite/icloud.mrs",           "icloud.mrs"),
+    ("cn-domain",  "domain", "geosite/cn.mrs",               "cn-domain.mrs"),
+    ("telegram-ip","ipcidr", "geoip/telegram.mrs",           "telegram-ip.mrs"),
+    ("cn-ip",      "ipcidr", "geoip/cn.mrs",                 "cn-ip.mrs"),
+    ("private-ip", "ipcidr", "geoip/private.mrs",            "private-ip.mrs"),
+]
+META_RULES_BASE = "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo"
+
 # Pin the 3x-ui version the whole fleet runs on. The panel API client below
 # (login → session cookie → /panel/api/inbounds) handles both the 2.8.x API
 # and the CSRF-token login that 3.4.x added — see REMOTE_INBOUND_SCRIPT. When
@@ -374,18 +401,21 @@ def load_rules():
 
     Rule priority (top = highest):
       1. AI services (inline)        → 🤖 AI Services
-      2. Applications (rule-provider)→ DIRECT
-      3. Reject ads (rule-provider)  → REJECT
-      4. Custom direct (inline)      → DIRECT  (China AI, .cn, etc.)
-      5. Telegram CIDRs (provider)   → 🚀 Proxy
-      6. Private domains (provider)  → DIRECT
-      7. Apple (provider)            → DIRECT
-      8. iCloud (provider)           → DIRECT
-      9. China domains (provider)    → DIRECT
-     10. China CIDRs (provider)      → DIRECT
-     11. LAN CIDRs (provider)        → DIRECT
-     12. GEOIP CN                    → DIRECT
-     13. MATCH                       → 🐟 Final (default proxy)
+      2. Ads (geosite mrs)           → REJECT
+      3. Custom direct (inline)      → DIRECT  (China AI, .cn, etc.)
+      4. Telegram IPs (geoip mrs)    → 🚀 Proxy
+      5. Private domains (geosite)   → DIRECT
+      6. Apple (geosite mrs)         → DIRECT
+      7. iCloud (geosite mrs)        → DIRECT
+      8. China domains (geosite mrs) → DIRECT
+      9. China IPs (geoip mrs)       → DIRECT
+     10. Private/LAN IPs (geoip mrs) → DIRECT
+     11. MATCH                       → 🐟 Final (default proxy)
+
+    All rule-sets are MetaCubeX .mrs (see RULE_PROVIDERS). No GEOIP,CN literal
+    and no geoip database: China IPs come from the cn-ip set, so nothing has to
+    be downloaded on first launch beyond the small .mrs files we self-host.
+    Anything unmatched just gets proxied — the correct whitelist-mode default.
     """
     def _load_inline(name):
         lines = []
@@ -402,22 +432,20 @@ def load_rules():
     # Inline rules (manually curated, highest priority)
     rules += _load_inline("ai")
 
-    # Rule-provider references (Loyalsoldier/clash-rules, auto-updating)
-    rules.append("- RULE-SET,applications,DIRECT")
-    rules.append("- RULE-SET,reject,REJECT")
+    # Ad-blocking (compiled geosite set)
+    rules.append("- RULE-SET,ads,REJECT")
 
     # Custom direct rules (China AI services, .cn TLD, etc.)
     rules += _load_inline("direct")
 
-    # Remote rule-provider references (continued)
-    rules.append("- RULE-SET,telegramcidr,🚀 Proxy,no-resolve")
+    # Compiled .mrs rule-set references (mirrored to our own host)
+    rules.append("- RULE-SET,telegram-ip,🚀 Proxy,no-resolve")
     rules.append("- RULE-SET,private,DIRECT")
     rules.append("- RULE-SET,apple,DIRECT")
     rules.append("- RULE-SET,icloud,DIRECT")
-    rules.append("- RULE-SET,direct,DIRECT")
-    rules.append("- RULE-SET,cncidr,DIRECT,no-resolve")
-    rules.append("- RULE-SET,lancidr,DIRECT,no-resolve")
-    rules.append("- GEOIP,CN,DIRECT")
+    rules.append("- RULE-SET,cn-domain,DIRECT")
+    rules.append("- RULE-SET,cn-ip,DIRECT,no-resolve")
+    rules.append("- RULE-SET,private-ip,DIRECT,no-resolve")
     rules.append("- MATCH,🐟 Final")
 
     return rules
@@ -426,12 +454,22 @@ def generate_subscription(cfg, node_details):
     """Generate complete mihomo YAML config."""
     nodes = cfg["nodes"]
     defaults = cfg["defaults"]
+    sub = cfg["subscription"]
     dns_cfg = defaults.get("dns", {})
 
-    # DNS servers (configurable, with sensible defaults)
+    # DNS (configurable). With fake-ip, every proxied domain is resolved at the
+    # exit node, so locally we only need to resolve DIRECT/China domains — a
+    # domestic resolver does that well. default-nameserver (plain IP) bootstraps
+    # the DoH hostnames; nameserver (domestic DoH) does the real work. No
+    # foreign fallback / geoip fallback-filter → no geoip database needed on
+    # first launch, which is what makes this cold-start cleanly on iOS.
     domestic_ns = dns_cfg.get("domestic", ["223.5.5.5", "119.29.29.29"])
-    domestic_doh = dns_cfg.get("domestic_doh", ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"])
-    foreign_dns = dns_cfg.get("foreign", ["https://dns.google/dns-query", "https://cloudflare-dns.com/dns-query"])
+    # IP-literal DoH (not dns.alidns.com/doh.pub hostnames): inside the iOS
+    # network extension, bootstrapping a DoH *hostname* via plain UDP can stall,
+    # taking DNS — and therefore all browsing — down with it. Connecting to the
+    # resolver by IP removes that bootstrap step entirely. Both endpoints serve
+    # DoH with a cert valid for the IP (AliDNS 223.5.5.5, DNSPod 1.12.12.12).
+    domestic_doh = dns_cfg.get("domestic_doh", ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"])
 
     # Build proxy list
     proxies = []
@@ -491,12 +529,25 @@ def generate_subscription(cfg, node_details):
         "mode: rule",
         "log-level: info",
         "unified-delay: true",
-        "find-process-mode: strict",
-        "global-client-fingerprint: chrome",
+        # race multiple resolved IPs for faster, more reliable connects.
+        "tcp-concurrent: true",
+        # process matching is impossible inside the iOS network extension and
+        # we ship no PROCESS-NAME rules, so keep it off everywhere. Quoted so
+        # YAML 1.1 parsers don't fold bare `off` into the boolean false.
+        'find-process-mode: "off"',
+        # NOTE: no top-level `global-client-fingerprint`. Newer mihomo cores
+        # (e.g. the one Clash Mi ships) removed it and log an error; each proxy
+        # already carries its own `client-fingerprint`, so nothing is lost.
+        "",
+        # store-selected: remember the user's manual group choice across
+        # restarts / subscription updates. store-fake-ip: persist the fake-ip
+        # pool so restarts don't re-resolve everything (faster mobile resume).
+        "profile:",
+        "  store-selected: true",
+        "  store-fake-ip: true",
         "",
         "dns:",
         "  enable: true",
-        "  listen: :1053",
         "  ipv6: false",
         "  enhanced-mode: fake-ip",
         "  fake-ip-range: 198.18.0.1/16",
@@ -513,13 +564,7 @@ def generate_subscription(cfg, node_details):
     lines.append("  nameserver:")
     for ns in domestic_doh:
         lines.append(f"    - {ns}")
-    lines.append("  fallback:")
-    for ns in foreign_dns:
-        lines.append(f"    - {ns}")
     lines += [
-        "  fallback-filter:",
-        "    geoip: true",
-        "    geoip-code: CN",
         "",
         "proxies:",
     ]
@@ -564,26 +609,22 @@ def generate_subscription(cfg, node_details):
     lines.append("      - DIRECT")
     lines.append("")
 
-    # Rule providers (Loyalsoldier/clash-rules — auto-updates daily)
+    # Rule providers. Compiled .mrs sets, mirrored (by `sync`) onto our own
+    # subscription host and served from the same origin the client already
+    # fetches the config from — NOT cdn.jsdelivr.net, which is routinely
+    # DNS-poisoned/blocked in mainland China. Two failure modes are removed at
+    # once: (1) a blocked cold-start fetch is fatal on a fresh iOS client, and
+    # (2) the old multi-MB text lists OOM'd the iOS network extension. See
+    # RULE_PROVIDERS / mirror step.
     lines.append("rule-providers:")
-    _providers = [
-        ("reject",       "domain",    "reject.txt"),
-        ("private",      "domain",    "private.txt"),
-        ("apple",        "domain",    "apple.txt"),
-        ("icloud",       "domain",    "icloud.txt"),
-        ("direct",       "domain",    "direct.txt"),
-        ("applications", "classical", "applications.txt"),
-        ("cncidr",       "ipcidr",    "cncidr.txt"),
-        ("lancidr",      "ipcidr",    "lancidr.txt"),
-        ("telegramcidr", "ipcidr",    "telegramcidr.txt"),
-    ]
-    _base = "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release"
-    for pname, behavior, filename in _providers:
+    _base = f"https://{sub['domain']}/{sub['url_path']}/ruleset"
+    for pname, behavior, _upstream, filename in RULE_PROVIDERS:
         lines.append(f"  {pname}:")
         lines.append(f"    type: http")
         lines.append(f"    behavior: {behavior}")
+        lines.append(f"    format: mrs")
         lines.append(f'    url: "{_base}/{filename}"')
-        lines.append(f"    path: ./ruleset/{pname}.yaml")
+        lines.append(f"    path: ./ruleset/{filename}")
         lines.append(f"    interval: 86400")
     lines.append("")
 
@@ -802,6 +843,47 @@ def cmd_remove(host):
 
     cmd_sync()
 
+def mirror_rulesets(sub):
+    """Mirror the MetaCubeX .mrs rule sets onto our own subscription host.
+
+    Runs on the VPS (which reaches GitHub/jsdelivr fine) and drops each .mrs
+    into <file_path>/ruleset/ so the generated config can reference them from
+    our own origin instead of cdn.jsdelivr.net. Returns True if every file
+    landed non-empty — a missing/empty ruleset would 404 the client and
+    reintroduce the cold-start failure we are trying to remove.
+    """
+    rp_dir = f"{sub['file_path']}/ruleset"
+    # each entry: "<upstream_path>::<local_filename>" so the remote loop can map
+    # MetaCubeX's geosite/geoip subpaths onto our flat ruleset filenames.
+    pairs = " ".join(f"{up}::{fn}" for _, _, up, fn in RULE_PROVIDERS)
+    names = " ".join(fn for _, _, _, fn in RULE_PROVIDERS)
+    script = (
+        f"set -e; mkdir -p {rp_dir}; cd {rp_dir}; ok=1; "
+        f"for pair in {pairs}; do "
+        f'  up="${{pair%%::*}}"; fn="${{pair##*::}}"; '
+        f"  curl -fsSL --retry 3 --connect-timeout 20 "
+        f'    "{META_RULES_BASE}/$up" -o "$fn.tmp" && mv "$fn.tmp" "$fn" '
+        f'    || {{ echo "FAIL $up" >&2; ok=0; }}; '
+        f"done; "
+        # report each file's size so a silently-empty mirror is visible
+        f'for f in {names}; do printf "%s %s\\n" "$f" "$(wc -c < "$f" 2>/dev/null || echo 0)"; done; '
+        f"test $ok -eq 1"
+    )
+    r = subprocess.run(
+        ["ssh", sub["ssh_host"], script],
+        capture_output=True, text=True, timeout=120
+    )
+    sizes = [l for l in r.stdout.strip().splitlines() if l]
+    empty = [l for l in sizes if l.endswith(" 0")]
+    if r.returncode == 0 and not empty:
+        print(f"  Mirrored {len(sizes)} rulesets → {sub['ssh_host']}:{rp_dir}")
+        return True
+    print(f"  ⚠️  Ruleset mirror incomplete: {r.stderr.strip() or 'empty file(s)'}")
+    if empty:
+        print(f"     empty: {', '.join(l.split()[0] for l in empty)}")
+    return False
+
+
 def cmd_sync():
     cfg = load_config()
     nodes = cfg["nodes"]
@@ -843,6 +925,12 @@ def cmd_sync():
         print(f"📋 https://{sub['domain']}/{sub['url_path']}/config.yaml")
     else:
         print(f"❌ Upload failed: {r.stderr}")
+        return
+
+    # Mirror rule sets onto our own origin (see mirror_rulesets). Clients now
+    # fetch rulesets from the same reachable host as the config, not jsdelivr.
+    print("Mirroring rule sets...")
+    mirror_rulesets(sub)
 
 # ── Main ─────────────────────────────────────────────────────
 
