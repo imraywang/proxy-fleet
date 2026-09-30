@@ -665,8 +665,10 @@ def generate_subscription(cfg, node_details):
         print("  Warning: no active VLESS inbounds found on any node")
         return ""
 
-    # AI group: US nodes first, then others
-    ai_order = us_names + [n for n in proxy_names if n not in us_names]
+    # AI group: US nodes only. OpenAI / Anthropic / Gemini refuse HK (and
+    # can flag non-US exits), so offering JP/HK there is a trap. Falls back to
+    # every node only if the fleet has no US node at all.
+    ai_order = us_names or proxy_names
     # Proxy group: HK/JP first for lower latency
     proxy_order = [n for n in proxy_names if "🇭🇰" in n or "🇯🇵" in n] + \
                   [n for n in proxy_names if "🇭🇰" not in n and "🇯🇵" not in n]
