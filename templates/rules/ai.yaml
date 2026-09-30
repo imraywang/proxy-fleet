@@ -13,6 +13,8 @@
 # Anthropic / Claude
 - DOMAIN-SUFFIX,anthropic.com,🤖 AI Services
 - DOMAIN-SUFFIX,claude.ai,🤖 AI Services
+- DOMAIN-SUFFIX,claude.com,🤖 AI Services
+- DOMAIN-SUFFIX,claudeusercontent.com,🤖 AI Services
 - DOMAIN-KEYWORD,anthropic,🤖 AI Services
 
 # Google AI / Gemini / DeepMind

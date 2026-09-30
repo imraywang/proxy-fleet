@@ -37,6 +37,7 @@ RULES_DIR = SKILL_DIR / "templates" / "rules"
 # jsdelivr fine — and drops them next to config.yaml, so clients only ever pull
 # rulesets from our own reachable origin (jsdelivr is poisoned in China).
 RULE_PROVIDERS = [
+    ("ai",         "domain", "geosite/category-ai-!cn.mrs",  "ai.mrs"),
     ("ads",        "domain", "geosite/category-ads-all.mrs", "ads.mrs"),
     ("private",    "domain", "geosite/private.mrs",          "private.mrs"),
     ("apple",      "domain", "geosite/apple.mrs",            "apple.mrs"),
@@ -61,6 +62,8 @@ META_RULES_BASE = "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo
 # false positives and a real memory risk in the iOS network extension.
 SR_RULES_BASE = "https://raw.githubusercontent.com/Loyalsoldier/surge-rules/release"
 SR_RULESETS = [
+    ("ai",          "DOMAIN-SET", f"{META_RULES_BASE}/geosite/category-ai-!cn.list",
+                                  "sr-ai.txt",          "mihomo-list"),
     ("ads",         "DOMAIN-SET", f"{META_RULES_BASE}/geosite/category-ads-all.list",
                                   "sr-ads.txt",         "mihomo-list"),
     ("private",     "DOMAIN-SET", f"{SR_RULES_BASE}/private.txt",      "sr-private.txt",     "txt"),
@@ -462,6 +465,7 @@ def load_rules():
 
     Rule priority (top = highest):
       1. AI services (inline)        → 🤖 AI Services
+         AI services (geosite mrs)   → 🤖 AI Services  (category-ai-!cn)
       2. Ads (geosite mrs)           → REJECT
       3. Custom direct (inline)      → DIRECT  (China AI, .cn, etc.)
       4. Telegram IPs (geoip mrs)    → 🚀 Proxy
@@ -471,7 +475,8 @@ def load_rules():
       8. China domains (geosite mrs) → DIRECT
       9. China IPs (geoip mrs)       → DIRECT
      10. Private/LAN IPs (geoip mrs) → DIRECT
-     11. MATCH                       → 🐟 Final (default proxy)
+     11. QUIC (UDP/443)              → REJECT  (only what would be proxied)
+     12. MATCH                       → 🐟 Final (default proxy)
 
     All rule-sets are MetaCubeX .mrs (see RULE_PROVIDERS). No GEOIP,CN literal
     and no geoip database: China IPs come from the cn-ip set, so nothing has to
@@ -482,6 +487,9 @@ def load_rules():
 
     # Inline rules (manually curated, highest priority)
     rules += _load_inline("ai")
+    # maintained upstream list; the inline file stays for additions and so AI
+    # routing works even before the ruleset has been fetched once.
+    rules.append("- RULE-SET,ai,🤖 AI Services")
 
     # Ad-blocking (compiled geosite set)
     rules.append("- RULE-SET,ads,REJECT")
@@ -497,6 +505,11 @@ def load_rules():
     rules.append("- RULE-SET,cn-domain,DIRECT")
     rules.append("- RULE-SET,cn-ip,DIRECT,no-resolve")
     rules.append("- RULE-SET,private-ip,DIRECT,no-resolve")
+    # Vision flow carries QUIC poorly. Everything that reaches this point is
+    # headed for the proxy, so dropping UDP/443 here makes HTTP/3 fall back to
+    # TCP without touching direct traffic — same as Shadowrocket's
+    # block-quic=all-proxy. (AI / Telegram matched above keep their UDP.)
+    rules.append("- AND,((NETWORK,UDP),(DST-PORT,443)),REJECT")
     rules.append("- MATCH,🐟 Final")
 
     return rules
@@ -620,12 +633,27 @@ def generate_subscription(cfg, node_details):
         "  ipv6: false",
         "  enhanced-mode: fake-ip",
         "  fake-ip-range: 198.18.0.1/16",
+        # domains that must see a real IP: LAN names, OS connectivity checks,
+        # NTP (clock sync before the tunnel is fully up), STUN (NAT discovery
+        # for calls/WebRTC), console networks and QQ's localhost login helper.
         "  fake-ip-filter:",
         '    - "*.lan"',
         '    - "*.local"',
         '    - "*.localhost"',
+        '    - "+.home.arpa"',
         '    - "+.msftconnecttest.com"',
         '    - "+.msftncsi.com"',
+        '    - "time.*.com"',
+        '    - "time.*.gov"',
+        '    - "time.*.apple.com"',
+        '    - "ntp.*.com"',
+        '    - "+.pool.ntp.org"',
+        '    - "+.stun.*.*"',
+        '    - "+.stun.*.*.*"',
+        '    - "stun.l.google.com"',
+        '    - "+.srv.nintendo.net"',
+        '    - "+.xboxlive.com"',
+        '    - "localhost.ptlogin2.qq.com"',
         "  default-nameserver:",
     ]
     for ns in domestic_ns:
@@ -633,7 +661,24 @@ def generate_subscription(cfg, node_details):
     lines.append("  nameserver:")
     for ns in domestic_doh:
         lines.append(f"    - {ns}")
+    # Sniffer: recover the domain from TLS SNI / HTTP Host / QUIC for
+    # connections that arrive as a bare IP (hardcoded IPs, in-app DoH), so
+    # domain rules still apply to them. override-destination stays off: the
+    # sniffed name is used for rule matching only, never to re-dial.
     lines += [
+        "",
+        "sniffer:",
+        "  enable: true",
+        "  force-dns-mapping: true",
+        "  parse-pure-ip: true",
+        "  override-destination: false",
+        "  sniff:",
+        "    HTTP:",
+        "      ports: [80, 8080-8880]",
+        "    TLS:",
+        "      ports: [443, 8443]",
+        "    QUIC:",
+        "      ports: [443, 8443]",
         "",
         "proxies:",
     ]
@@ -813,6 +858,7 @@ def generate_shadowrocket_conf(cfg):
         "[Rule]",
     ]
     lines += _sr_inline("ai")
+    lines.append(ruleset("ai", "AI"))
     lines.append(ruleset("ads", "REJECT"))
     lines += _sr_inline("direct")
     lines += [
@@ -862,16 +908,15 @@ def cmd_init():
     print("\n--- DNS config ---")
     dns_preset = input("DNS preset - [1] China, [2] Global [1]: ").strip() or "1"
     if dns_preset == "2":
+        # IP-literal DoH only — see dns_servers() for why hostnames stall on iOS.
         dns_cfg = {
             "domestic": ["8.8.8.8", "1.1.1.1"],
-            "domestic_doh": ["https://dns.google/dns-query", "https://cloudflare-dns.com/dns-query"],
-            "foreign": ["https://dns.google/dns-query", "https://cloudflare-dns.com/dns-query"]
+            "domestic_doh": ["https://8.8.8.8/dns-query", "https://1.1.1.1/dns-query"],
         }
     else:
         dns_cfg = {
             "domestic": ["223.5.5.5", "119.29.29.29"],
-            "domestic_doh": ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"],
-            "foreign": ["https://dns.google/dns-query", "https://cloudflare-dns.com/dns-query"]
+            "domestic_doh": ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"],
         }
 
     cfg = {
