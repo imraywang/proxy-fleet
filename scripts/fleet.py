@@ -196,15 +196,37 @@ def install_3xui(host, creds):
         print(f"  [{host}] Install complete")
 
     # Always reset credentials to ensure consistency
+    harden_panel(host, creds)
+
+
+def harden_panel(host, creds):
+    """Set credentials and keep the 3x-ui panel off the public internet.
+
+    Everything this script does talks to the panel over SSH at localhost, so
+    nothing needs it reachable from outside — and it speaks plain HTTP, so a
+    public listener would send the login in cleartext. Bind it to loopback
+    (web UI: `ssh -L <port>:127.0.0.1:<port> <host>`) and turn off 3x-ui's own
+    subscription server (port 2096): clients get their config from our nginx
+    origin, so it's pure attack surface. subEnable has no CLI flag, so it's
+    written straight into the settings table.
+    """
     ssh(host, (
         f"/usr/local/x-ui/x-ui setting "
         f"-username {creds['username']} "
         f"-password {creds['password']} "
         f"-port {creds['panel_port']} "
+        f"-listenIP 127.0.0.1 "
         f"-webBasePath /"
     ))
+    ssh_script(host, textwrap.dedent("""
+        import sqlite3
+        c = sqlite3.connect("/etc/x-ui/x-ui.db")
+        c.execute("delete from settings where key = 'subEnable'")
+        c.execute("insert into settings (key, value) values ('subEnable', 'false')")
+        c.commit()
+    """))
     ssh(host, "systemctl restart x-ui")
-    print(f"  [{host}] Credentials set (panel port {creds['panel_port']})")
+    print(f"  [{host}] Panel on 127.0.0.1:{creds['panel_port']} only, built-in sub server off")
 
 # ── VLESS+Reality Inbound ────────────────────────────────────
 
