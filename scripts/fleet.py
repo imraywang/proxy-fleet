@@ -49,20 +49,27 @@ RULE_PROVIDERS = [
 META_RULES_BASE = "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo"
 
 # Shadowrocket can't read .mrs (mihomo's binary format), so its config gets
-# the same routing semantics from Loyalsoldier's Surge-format text lists,
-# mirrored onto the same host as the .mrs sets. (local_name, rule_type,
-# upstream_file, local_filename). Domain lists are DOMAIN-SET (`.example.com`
-# lines), the cidr lists are RULE-SET (`IP-CIDR,...` lines, no policy).
-SR_RULESETS = [
-    ("ads",         "DOMAIN-SET", "reject.txt",       "sr-ads.txt"),
-    ("private",     "DOMAIN-SET", "private.txt",      "sr-private.txt"),
-    ("apple",       "DOMAIN-SET", "apple.txt",        "sr-apple.txt"),
-    ("icloud",      "DOMAIN-SET", "icloud.txt",       "sr-icloud.txt"),
-    ("cn-domain",   "DOMAIN-SET", "direct.txt",       "sr-cn-domain.txt"),
-    ("telegram-ip", "RULE-SET",   "telegramcidr.txt", "sr-telegram-ip.txt"),
-    ("cn-ip",       "RULE-SET",   "cncidr.txt",       "sr-cn-ip.txt"),
-]
+# the same routing semantics from Surge-format text lists, mirrored onto the
+# same host as the .mrs sets. (local_name, rule_type, upstream_url,
+# local_filename, kind). Domain lists are DOMAIN-SET (`.example.com` lines),
+# the cidr lists are RULE-SET (`IP-CIDR,...` lines, no policy).
+#
+# kind "txt" is mirrored as-is. kind "mihomo-list" is MetaCubeX's text form
+# of a geosite set (`+.example.com` / `example.com` lines), rewritten to
+# DOMAIN-SET syntax on the host. Ads use it so both clients block the same
+# ~900 domains: Loyalsoldier's reject.txt is ~186k lines / 4 MB — far more
+# false positives and a real memory risk in the iOS network extension.
 SR_RULES_BASE = "https://raw.githubusercontent.com/Loyalsoldier/surge-rules/release"
+SR_RULESETS = [
+    ("ads",         "DOMAIN-SET", f"{META_RULES_BASE}/geosite/category-ads-all.list",
+                                  "sr-ads.txt",         "mihomo-list"),
+    ("private",     "DOMAIN-SET", f"{SR_RULES_BASE}/private.txt",      "sr-private.txt",     "txt"),
+    ("apple",       "DOMAIN-SET", f"{SR_RULES_BASE}/apple.txt",        "sr-apple.txt",       "txt"),
+    ("icloud",      "DOMAIN-SET", f"{SR_RULES_BASE}/icloud.txt",       "sr-icloud.txt",      "txt"),
+    ("cn-domain",   "DOMAIN-SET", f"{SR_RULES_BASE}/direct.txt",       "sr-cn-domain.txt",   "txt"),
+    ("telegram-ip", "RULE-SET",   f"{SR_RULES_BASE}/telegramcidr.txt", "sr-telegram-ip.txt", "txt"),
+    ("cn-ip",       "RULE-SET",   f"{SR_RULES_BASE}/cncidr.txt",       "sr-cn-ip.txt",       "txt"),
+]
 
 # Files `sync` publishes under subscription.file_path.
 CLASH_FILE = "config.yaml"
@@ -755,7 +762,7 @@ def generate_shadowrocket_conf(cfg):
     sub = cfg["subscription"]
     domestic_ns, domestic_doh = dns_servers(cfg)
     origin = f"https://{sub['domain']}/{sub['url_path']}"
-    rs = {name: (rtype, f"{origin}/ruleset/{fn}") for name, rtype, _, fn in SR_RULESETS}
+    rs = {name: (rtype, f"{origin}/ruleset/{fn}") for name, rtype, _, fn, _ in SR_RULESETS}
 
     def ruleset(name, policy, no_resolve=False):
         rtype, url = rs[name]
@@ -1040,7 +1047,7 @@ MIRROR_LOG_PATH = "/var/log/proxy-fleet-mirror.log"
 def _mirror_entries():
     """(upstream_url, local_filename, kind) for every mirrored rule set."""
     return ([(f"{META_RULES_BASE}/{up}", fn, "mrs") for _, _, up, fn in RULE_PROVIDERS] +
-            [(f"{SR_RULES_BASE}/{up}", fn, "txt") for _, _, up, fn in SR_RULESETS])
+            [(url, fn, kind) for _, _, url, fn, kind in SR_RULESETS])
 
 
 def _mirror_script(sub):
@@ -1077,6 +1084,10 @@ def _mirror_script(sub):
           else
             magic=text
             head -c 512 "$fn.tmp" | grep -qi '<html\\|<!doctype' && valid=0 || valid=1
+            # mihomo text geosite → Surge DOMAIN-SET: `+.x` (x and subdomains) is `.x`
+            if [ $valid -eq 1 ] && [ "$kind" = mihomo-list ]; then
+              sed 's/^+\\././' "$fn.tmp" > "$fn.conv" && mv "$fn.conv" "$fn.tmp" || valid=0
+            fi
           fi
           if [ $valid -eq 1 ] && [ "$size" -gt 100 ]; then
             mv "$fn.tmp" "$fn"
