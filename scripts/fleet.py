@@ -96,9 +96,10 @@ XUI_VERSION = "v3.8.5"
 # probe a node with it before rolling out.
 #
 # v26.7.x also defaults an empty REALITY minClientVer to 26.3.27, which
-# rejects mihomo (it reports a hardcoded 1.8.2). Existing inbounds carry an
-# explicit minClientVer for that; new ones created by REMOTE_INBOUND_SCRIPT
-# don't yet — set it on the inbound after deploy.
+# rejects mihomo (it reports a hardcoded 1.8.2). REMOTE_INBOUND_SCRIPT sets an
+# explicit "0.0.0" on every inbound it creates. Note a freshly added inbound
+# works either way until the core restarts: 3x-ui hot-adds it with its own
+# embedded (newer) parser — so probe after a restart, not before.
 XRAY_VERSION = "v26.7.28"
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -413,6 +414,9 @@ stream = json.dumps({
         "show": False, "xver": 0, "dest": f"{sni}:443",
         "serverNames": [sni], "privateKey": priv,
         "minClient": "", "maxClient": "", "maxTimediff": 0, "shortIds": [sid],
+        # explicit floor: Xray v26.7.x turns an empty minClientVer into
+        # 26.3.27, and mihomo reports a hardcoded 1.8.2 (see XRAY_VERSION)
+        "minClientVer": "0.0.0",
         "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "", "spiderX": "/"}
     },
     "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}

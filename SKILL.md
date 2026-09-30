@@ -92,7 +92,7 @@ These matter when debugging or extending the skill:
   REALITY ClientHellos without X25519MLKEM768, which locks Shadowrocket out. Clash needs
   `support-x25519mlkem768: true` (generated). Don't raise the pin without probing Shadowrocket.
 - **REALITY minClientVer**: Xray v26.7.x defaults an empty value to 26.3.27; mihomo reports
-  1.8.2 and would be refused. Existing inbounds carry an explicit value.
+  1.8.2 and would be refused. Inbounds are created with an explicit `"0.0.0"`.
 - **sync order**: rule sets are mirrored *before* configs are published, and every file is
   written to `.tmp` then `mv`'d — a config must never reference a ruleset the host can't serve.
 - **Ruleset mirror cron**: `sync` installs `/etc/cron.d/proxy-fleet-mirror` on the subscription
