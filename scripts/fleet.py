@@ -398,7 +398,8 @@ settings = json.dumps({
     "clients": [{"id": uuid, "flow": "xtls-rprx-vision",
                  "email": f"{remark}-{secrets.token_hex(3)}",
                  "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True,
-                 "tgId": "", "subId": secrets.token_hex(8), "reset": 0}],
+                 # tgId is an int64 from 3.6.0 on ("" → unmarshal error)
+                 "tgId": 0, "subId": secrets.token_hex(8), "reset": 0}],
     "decryption": "none", "fallbacks": []
 })
 # NOTE on the Reality dest (= defaults.sni): pick a TLS-1.3 site whose
@@ -428,7 +429,7 @@ body = json.dumps({
 result = json.loads(opener.open(api("/panel/api/inbounds/add", body, json_body=True)).read())
 
 print(json.dumps({
-    "success": result.get("success", False),
+    "success": result.get("success", False), "error": result.get("msg", ""),
     "uuid": uuid, "public_key": pub, "short_id": sid, "port": port
 }))
 ''')
@@ -1071,7 +1072,7 @@ def cmd_status():
     print(f"\n📋 Subscription: https://{sub['domain']}/{sub['url_path']}/config.yaml")
     print(f"   Hosted on: {sub['ssh_host']} ({sub['file_path']})\n")
 
-def cmd_deploy(hosts, nat_range=None, name_override=None, emoji_override=None):
+def cmd_deploy(hosts, nat_range=None, name_override=None, emoji_override=None, sync=True):
     cfg = load_config()
     creds = cfg["credentials"]
     defaults = cfg["defaults"]
@@ -1117,8 +1118,9 @@ def cmd_deploy(hosts, nat_range=None, name_override=None, emoji_override=None):
             print(f"  [{host}] ❌ Inbound creation failed: {e}")
             continue
 
-        # 7. Firewall
-        configure_firewall(host, [port, creds["panel_port"]])
+        # 7. Firewall — proxy port only: the panel is bound to 127.0.0.1
+        # (harden_panel) and reached over SSH, so it needs no public rule.
+        configure_firewall(host, [port])
 
         # 8. Verify
         reachable = verify_port(server, port)
@@ -1149,7 +1151,11 @@ def cmd_deploy(hosts, nat_range=None, name_override=None, emoji_override=None):
             save_config(cfg)
             print(f"  [{host}] Updated in fleet config")
 
-    # 10. Sync subscription
+    # 10. Sync subscription. --no-sync holds the node back so it can be
+    # probed (and its REALITY minClientVer set) before clients see it.
+    if not sync:
+        print("\n--no-sync: subscription not updated. Run `sync` once the node checks out.")
+        return
     print(f"\n{'='*50}")
     print("Syncing subscription...")
     cmd_sync()
@@ -1364,6 +1370,7 @@ def main():
         nat_range = None
         name_override = None
         emoji_override = None
+        sync = True
         i = 2
         while i < len(sys.argv):
             if sys.argv[i] == "--nat" and i + 1 < len(sys.argv):
@@ -1373,13 +1380,16 @@ def main():
             elif sys.argv[i] == "--name" and i + 1 < len(sys.argv):
                 name_override = sys.argv[i + 1]
                 i += 2
+            elif sys.argv[i] == "--no-sync":
+                sync = False
+                i += 1
             elif sys.argv[i] == "--emoji" and i + 1 < len(sys.argv):
                 emoji_override = sys.argv[i + 1]
                 i += 2
             else:
                 hosts.append(sys.argv[i])
                 i += 1
-        cmd_deploy(hosts, nat_range, name_override, emoji_override)
+        cmd_deploy(hosts, nat_range, name_override, emoji_override, sync)
     elif cmd == "remove":
         if len(sys.argv) < 3:
             print("Usage: fleet.py remove <host>")
