@@ -62,6 +62,15 @@ SSH 连接 → 扫描已占用端口 → 自动选可用端口
 
 生成的 Clash YAML 通过 SSH 上传到指定 VPS，用 nginx + SSL 提供 HTTPS 访问（推荐 Cloudflare 代理）。用户在 Clash Verge Rev / Mihomo 中导入订阅 URL 即可获取全部节点和分流规则。
 
+`sync` 同时生成一对 Shadowrocket 文件（Shadowrocket 读不了 mihomo 的 `.mrs` 规则集）：
+
+| 文件 | 在 Shadowrocket 中的导入方式 |
+|---|---|
+| `shadowrocket.txt` | 首页「添加订阅」— base64 编码的 `vless://` 节点 |
+| `shadowrocket.conf` | 配置页「添加远程配置」— 分流规则 + 按节点名正则收纳节点的策略组 |
+
+两种客户端的规则集都镜像到同一台订阅服务器，设备端不需要访问 GitHub/jsDelivr。
+
 ### 代理分组
 
 | 分组 | 用途 |

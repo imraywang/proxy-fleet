@@ -70,6 +70,12 @@ SSH → scan ports (avoid conflicts) → pick available port
 Edit the relevant file in `templates/rules/`, then run `sync` to regenerate and upload
 the subscription. Users refresh in Clash Verge Rev to get changes.
 
+`sync` publishes three files under `subscription.file_path`: `config.yaml` (Clash/mihomo),
+`shadowrocket.txt` (Shadowrocket node subscription, base64 vless:// links) and
+`shadowrocket.conf` (Shadowrocket rules/groups; groups use `policy-regex-filter`, so the
+conf never names a node). Inline rules in `templates/rules/` feed both; group names are
+mapped via `SR_POLICY_MAP`.
+
 ## Technical Notes
 
 These matter when debugging or extending the skill:
@@ -81,6 +87,8 @@ These matter when debugging or extending the skill:
 - **3x-ui API**: `POST /login` → session cookie → `/panel/api/inbounds/{add,update,del,list}`.
 - **Reality returns HTTP 400** to non-VLESS clients — the connectivity check treats 400 as alive.
 - **Port conflicts** are the #1 deploy failure cause — the script scans ports before configuring.
+- **sync order**: rule sets are mirrored *before* configs are published, and every file is
+  written to `.tmp` then `mv`'d — a config must never reference a ruleset the host can't serve.
 - **Ruleset mirror cron**: `sync` installs `/etc/cron.d/proxy-fleet-mirror` on the subscription
   host (daily 04:17, script `/usr/local/sbin/proxy-fleet-mirror.sh`). The script validates the
   zstd magic before replacing any live `.mrs`, so a bad upstream day only means a stale mirror.

@@ -12,7 +12,7 @@ Usage:
     python3 fleet.py sync                              # Regenerate & upload subscription
 """
 
-import json, subprocess, sys, os, secrets, re, textwrap, time
+import json, subprocess, sys, os, secrets, re, textwrap, time, base64, urllib.parse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -47,6 +47,27 @@ RULE_PROVIDERS = [
     ("private-ip", "ipcidr", "geoip/private.mrs",            "private-ip.mrs"),
 ]
 META_RULES_BASE = "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo"
+
+# Shadowrocket can't read .mrs (mihomo's binary format), so its config gets
+# the same routing semantics from Loyalsoldier's Surge-format text lists,
+# mirrored onto the same host as the .mrs sets. (local_name, rule_type,
+# upstream_file, local_filename). Domain lists are DOMAIN-SET (`.example.com`
+# lines), the cidr lists are RULE-SET (`IP-CIDR,...` lines, no policy).
+SR_RULESETS = [
+    ("ads",         "DOMAIN-SET", "reject.txt",       "sr-ads.txt"),
+    ("private",     "DOMAIN-SET", "private.txt",      "sr-private.txt"),
+    ("apple",       "DOMAIN-SET", "apple.txt",        "sr-apple.txt"),
+    ("icloud",      "DOMAIN-SET", "icloud.txt",       "sr-icloud.txt"),
+    ("cn-domain",   "DOMAIN-SET", "direct.txt",       "sr-cn-domain.txt"),
+    ("telegram-ip", "RULE-SET",   "telegramcidr.txt", "sr-telegram-ip.txt"),
+    ("cn-ip",       "RULE-SET",   "cncidr.txt",       "sr-cn-ip.txt"),
+]
+SR_RULES_BASE = "https://raw.githubusercontent.com/Loyalsoldier/surge-rules/release"
+
+# Files `sync` publishes under subscription.file_path.
+CLASH_FILE = "config.yaml"
+SR_CONF_FILE = "shadowrocket.conf"   # rules + groups (Shadowrocket "config")
+SR_NODES_FILE = "shadowrocket.txt"   # base64 vless:// list (Shadowrocket "subscription")
 
 # Pin the 3x-ui version the whole fleet runs on. The panel API client below
 # (login → session cookie → /panel/api/inbounds) handles both the 2.8.x API
@@ -396,6 +417,17 @@ def verify_port(server, port, timeout=10):
 
 # ── Subscription Generator ───────────────────────────────────
 
+def _load_inline(name):
+    """Rule lines from templates/rules/<name>.yaml, as written (`- TYPE,value,target`)."""
+    lines = []
+    path = RULES_DIR / f"{name}.yaml"
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                lines.append(line)
+    return lines
+
 def load_rules():
     """Load rule templates and compose whitelist-mode rule list.
 
@@ -417,16 +449,6 @@ def load_rules():
     be downloaded on first launch beyond the small .mrs files we self-host.
     Anything unmatched just gets proxied — the correct whitelist-mode default.
     """
-    def _load_inline(name):
-        lines = []
-        path = RULES_DIR / f"{name}.yaml"
-        if path.exists():
-            for line in path.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    lines.append(line)
-        return lines
-
     rules = []
 
     # Inline rules (manually curated, highest priority)
@@ -450,19 +472,16 @@ def load_rules():
 
     return rules
 
-def generate_subscription(cfg, node_details):
-    """Generate complete mihomo YAML config."""
-    nodes = cfg["nodes"]
-    defaults = cfg["defaults"]
-    sub = cfg["subscription"]
-    dns_cfg = defaults.get("dns", {})
+def dns_servers(cfg):
+    """(bootstrap plain-IP resolvers, DoH resolvers) shared by both outputs.
 
-    # DNS (configurable). With fake-ip, every proxied domain is resolved at the
-    # exit node, so locally we only need to resolve DIRECT/China domains — a
-    # domestic resolver does that well. default-nameserver (plain IP) bootstraps
-    # the DoH hostnames; nameserver (domestic DoH) does the real work. No
-    # foreign fallback / geoip fallback-filter → no geoip database needed on
-    # first launch, which is what makes this cold-start cleanly on iOS.
+    With fake-ip (Clash) / remote resolution (Shadowrocket), every proxied
+    domain is resolved at the exit node, so locally we only need to resolve
+    DIRECT/China domains — a domestic resolver does that well. No foreign
+    fallback / geoip fallback-filter → no geoip database needed on first
+    launch, which is what makes this cold-start cleanly on iOS.
+    """
+    dns_cfg = cfg["defaults"].get("dns", {})
     domestic_ns = dns_cfg.get("domestic", ["223.5.5.5", "119.29.29.29"])
     # IP-literal DoH (not dns.alidns.com/doh.pub hostnames): inside the iOS
     # network extension, bootstrapping a DoH *hostname* via plain UDP can stall,
@@ -470,13 +489,18 @@ def generate_subscription(cfg, node_details):
     # resolver by IP removes that bootstrap step entirely. Both endpoints serve
     # DoH with a cert valid for the IP (AliDNS 223.5.5.5, DNSPod 1.12.12.12).
     domestic_doh = dns_cfg.get("domestic_doh", ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"])
+    return domestic_ns, domestic_doh
 
-    # Build proxy list
+
+def build_proxies(cfg, node_details):
+    """Proxy dicts for every node with a live VLESS inbound, plus the names of
+    all / US nodes (for group ordering)."""
+    defaults = cfg["defaults"]
     proxies = []
     proxy_names = []
     us_names = []
 
-    for node in nodes:
+    for node in cfg["nodes"]:
         nd = node_details.get(node["ssh_host"], {})
         inbounds = nd.get("inbounds", [])
         vless_ib = next((ib for ib in inbounds if ib["protocol"] == "vless"), None)
@@ -505,6 +529,15 @@ def generate_subscription(cfg, node_details):
             },
             "client-fingerprint": defaults["fingerprint"],
         })
+
+    return proxies, proxy_names, us_names
+
+
+def generate_subscription(cfg, node_details):
+    """Generate complete mihomo YAML config."""
+    sub = cfg["subscription"]
+    domestic_ns, domestic_doh = dns_servers(cfg)
+    proxies, proxy_names, us_names = build_proxies(cfg, node_details)
 
     if not proxies:
         print("  Warning: no active VLESS inbounds found on any node")
@@ -642,6 +675,130 @@ def generate_subscription(cfg, node_details):
     for r in rules:
         lines.append(f"  {r}")
 
+    return "\n".join(lines) + "\n"
+
+# ── Shadowrocket ─────────────────────────────────────────────
+#
+# Shadowrocket imports Clash YAML only partially (no .mrs, no sniffer, no
+# mihomo DNS keys), so it gets its own pair of files:
+#   shadowrocket.txt  — node subscription: base64 of standard vless:// links.
+#                       Reality can't be expressed in a .conf [Proxy] line
+#                       (undocumented keys), but share links import cleanly.
+#   shadowrocket.conf — rules + groups. Groups collect nodes by name regex
+#                       (policy-regex-filter), so the conf never hardcodes a
+#                       node and stays valid as the fleet changes.
+# Group names are plain ASCII: they're referenced unquoted in comma-separated
+# lines, and an emoji/space name is one parser quirk away from breaking.
+
+SR_TEST_URL = "http://cp.cloudflare.com/generate_204"
+SR_US_REGEX = "🇺🇸|US-"
+# inline rules target Clash group names; map them onto the Shadowrocket ones
+SR_POLICY_MAP = {"🤖 AI Services": "AI", "🚀 Proxy": "Proxy", "🐟 Final": "Final"}
+
+
+def _vless_uri(p):
+    """Standard (Xray-core) VLESS share link, which Shadowrocket imports."""
+    q = urllib.parse.urlencode({
+        "encryption": "none",
+        "flow": p["flow"],
+        "security": "reality",
+        "sni": p["servername"],
+        "fp": p["client-fingerprint"],
+        "pbk": p["reality-opts"]["public-key"],
+        "sid": p["reality-opts"]["short-id"],
+        "type": p["network"],
+    })
+    return f"vless://{p['uuid']}@{p['server']}:{p['port']}?{q}#{urllib.parse.quote(p['name'])}"
+
+
+def generate_sr_nodes(proxies):
+    """Shadowrocket subscription body: base64 of newline-separated links."""
+    links = "\n".join(_vless_uri(p) for p in proxies)
+    return base64.b64encode(links.encode()).decode() + "\n"
+
+
+def _sr_inline(name):
+    """templates/rules/<name>.yaml converted to Shadowrocket rule lines."""
+    out = []
+    for line in _load_inline(name):
+        parts = line.lstrip("- ").split(",")
+        if len(parts) >= 3:
+            parts[2] = SR_POLICY_MAP.get(parts[2], parts[2])
+        out.append(",".join(parts))
+    return out
+
+
+def generate_shadowrocket_conf(cfg):
+    """Shadowrocket config mirroring load_rules()'s whitelist-mode order."""
+    sub = cfg["subscription"]
+    domestic_ns, domestic_doh = dns_servers(cfg)
+    origin = f"https://{sub['domain']}/{sub['url_path']}"
+    rs = {name: (rtype, f"{origin}/ruleset/{fn}") for name, rtype, _, fn in SR_RULESETS}
+
+    def ruleset(name, policy, no_resolve=False):
+        rtype, url = rs[name]
+        return f"{rtype},{url},{policy}" + (",no-resolve" if no_resolve else "")
+
+    lines = [
+        "# Shadowrocket config | Generated by proxy-fleet",
+        f"# 节点订阅: {origin}/{SR_NODES_FILE}",
+        "# 先在首页添加上面的节点订阅，再导入本配置；策略组按节点名正则自动收纳节点。",
+        "",
+        "[General]",
+        "bypass-system = true",
+        "skip-proxy = 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local, captive.apple.com",
+        "tun-excluded-routes = 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, "
+        "192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.51.100.0/24, "
+        "203.0.113.0/24, 224.0.0.0/4, 255.255.255.255/32, 239.255.255.250/32",
+        # same resolver policy as the Clash config: domestic IP-literal DoH for
+        # DIRECT traffic, proxied domains resolve at the exit. No `system`
+        # fallback — that would hand queries to the ISP resolver.
+        f"dns-server = {', '.join(domestic_doh)}",
+        f"fallback-dns-server = {', '.join(domestic_ns)}",
+        "ipv6 = false",
+        "prefer-ipv6 = false",
+        "dns-direct-system = false",
+        "private-ip-answer = true",
+        "dns-direct-fallback-proxy = true",
+        "icmp-auto-reply = true",
+        "hijack-dns = 8.8.8.8:53, 8.8.4.4:53",
+        # Vision flow carries QUIC poorly; drop UDP/443 on proxied connections
+        # so HTTP/3 falls back to TCP. Direct connections keep QUIC.
+        "block-quic = all-proxy",
+        "udp-policy-not-supported-behaviour = REJECT",
+        f"update-url = {origin}/{SR_CONF_FILE}",
+        "",
+        "[Proxy Group]",
+        # AI defaults to automatic US failover — a dead manually-picked node
+        # otherwise takes every AI service down until someone notices.
+        "AI = select, US-Auto, US, Proxy, policy-select-name=US-Auto",
+        # PROXY is Shadowrocket's built-in "node selected on the home screen".
+        "Proxy = select, PROXY, Auto, US, DIRECT",
+        "Final = select, Proxy, DIRECT",
+        f"US-Auto = fallback, url={SR_TEST_URL}, interval=600, timeout=5, select=0, "
+        f"policy-regex-filter={SR_US_REGEX}",
+        f"US = select, policy-regex-filter={SR_US_REGEX}",
+        f"Auto = url-test, url={SR_TEST_URL}, interval=600, tolerance=50, timeout=5, select=0, "
+        "policy-regex-filter=.",
+        "",
+        "[Rule]",
+    ]
+    lines += _sr_inline("ai")
+    lines.append(ruleset("ads", "REJECT"))
+    lines += _sr_inline("direct")
+    lines += [
+        ruleset("telegram-ip", "Proxy", no_resolve=True),
+        ruleset("private", "DIRECT"),
+        ruleset("apple", "DIRECT"),
+        ruleset("icloud", "DIRECT"),
+        ruleset("cn-domain", "DIRECT"),
+        ruleset("cn-ip", "DIRECT", no_resolve=True),
+    ]
+    # LAN / reserved ranges (the Clash side gets these from geoip/private.mrs)
+    for cidr in ("10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+                 "172.16.0.0/12", "192.168.0.0/16"):
+        lines.append(f"IP-CIDR,{cidr},DIRECT,no-resolve")
+    lines.append("FINAL,Final")
     return "\n".join(lines) + "\n"
 
 # ── Commands ─────────────────────────────────────────────────
@@ -858,35 +1015,48 @@ MIRROR_CRON_PATH = "/etc/cron.d/proxy-fleet-mirror"
 MIRROR_LOG_PATH = "/var/log/proxy-fleet-mirror.log"
 
 
+def _mirror_entries():
+    """(upstream_url, local_filename, kind) for every mirrored rule set."""
+    return ([(f"{META_RULES_BASE}/{up}", fn, "mrs") for _, _, up, fn in RULE_PROVIDERS] +
+            [(f"{SR_RULES_BASE}/{up}", fn, "txt") for _, _, up, fn in SR_RULESETS])
+
+
 def _mirror_script(sub):
-    """Shell script that refreshes the .mrs mirror, installed on the sub host.
+    """Shell script that refreshes the rule-set mirror, installed on the sub host.
 
     Runs unattended from cron, so every download is validated before it
     replaces a live file: .mrs is a zstd frame, and a CDN error page or a
-    truncated response carries no 28 b5 2f fd magic — refusing those means a
-    bad upstream day degrades to "mirror is a bit stale", never to "clients
-    fetch garbage and the iOS core fails to start".
+    truncated response carries no 28 b5 2f fd magic; the Shadowrocket text
+    lists are checked for an HTML error body. Refusing those means a bad
+    upstream day degrades to "mirror is a bit stale", never to "clients fetch
+    garbage and the iOS core fails to start".
     """
     rp_dir = f"{sub['file_path']}/ruleset"
-    pairs = " ".join(f"{up}::{fn}" for _, _, up, fn in RULE_PROVIDERS)
+    entries = " ".join(f"{url}::{fn}::{kind}" for url, fn, kind in _mirror_entries())
     return textwrap.dedent(f"""\
         #!/bin/sh
-        # proxy-fleet: refresh mirrored MetaCubeX .mrs rule sets.
+        # proxy-fleet: refresh mirrored rule sets (MetaCubeX .mrs for Clash,
+        # Loyalsoldier surge-rules text lists for Shadowrocket).
         # Generated by `fleet.py sync` — edits are overwritten on next sync.
         set -u
         DIR={rp_dir}
-        BASE={META_RULES_BASE}
         mkdir -p "$DIR" || exit 1
         cd "$DIR" || exit 1
         ok=1
-        for pair in {pairs}; do
-          up=${{pair%%::*}}; fn=${{pair##*::}}
-          if ! curl -fsSL --retry 3 --connect-timeout 20 "$BASE/$up" -o "$fn.tmp"; then
-            echo "FAIL fetch $up" >&2; rm -f "$fn.tmp"; ok=0; continue
+        for e in {entries}; do
+          url=${{e%%::*}}; rest=${{e#*::}}; fn=${{rest%%::*}}; kind=${{rest##*::}}
+          if ! curl -fsSL --retry 3 --connect-timeout 20 "$url" -o "$fn.tmp"; then
+            echo "FAIL fetch $url" >&2; rm -f "$fn.tmp"; ok=0; continue
           fi
-          magic=$(od -An -N4 -tx1 "$fn.tmp" | tr -d ' \\n')
           size=$(wc -c < "$fn.tmp")
-          if [ "$magic" = "28b52ffd" ] && [ "$size" -gt 100 ]; then
+          if [ "$kind" = mrs ]; then
+            magic=$(od -An -N4 -tx1 "$fn.tmp" | tr -d ' \\n')
+            [ "$magic" = "28b52ffd" ] && valid=1 || valid=0
+          else
+            magic=text
+            head -c 512 "$fn.tmp" | grep -qi '<html\\|<!doctype' && valid=0 || valid=1
+          fi
+          if [ $valid -eq 1 ] && [ "$size" -gt 100 ]; then
             mv "$fn.tmp" "$fn"
             echo "OK $fn $size"
           else
@@ -920,7 +1090,7 @@ def mirror_rulesets(sub):
         input=_mirror_script(sub), capture_output=True, text=True, timeout=180
     )
     oks = [l for l in r.stdout.strip().splitlines() if l.startswith("OK ")]
-    if r.returncode == 0 and len(oks) == len(RULE_PROVIDERS):
+    if r.returncode == 0 and len(oks) == len(_mirror_entries()):
         print(f"  Mirrored {len(oks)} rulesets → {sub['ssh_host']}:{rp_dir}")
         print(f"  Cron installed: {MIRROR_CRON_PATH} (daily 04:17, log {MIRROR_LOG_PATH})")
         return True
@@ -954,27 +1124,45 @@ def cmd_sync():
     if not yaml_content:
         print("❌ No subscription content generated.")
         return
+    proxies, _, _ = build_proxies(cfg, node_details)
+    outputs = {
+        CLASH_FILE: yaml_content,
+        SR_CONF_FILE: generate_shadowrocket_conf(cfg),
+        SR_NODES_FILE: generate_sr_nodes(proxies),
+    }
+    print(f"\nGenerated subscriptions with {len(proxies)} nodes")
 
-    proxy_count = yaml_content.count("type: vless")
-    print(f"\nGenerated subscription with {proxy_count} nodes")
-
-    # Upload
+    # Mirror rule sets BEFORE publishing configs: a config that references a
+    # ruleset the host can't serve yet 404s on a fresh client's cold start.
+    # A failed refresh keeps the previous validated files, so we only abort
+    # when something is actually missing, not merely stale.
     sub = cfg["subscription"]
-    r = subprocess.run(
-        ["ssh", sub["ssh_host"], f"mkdir -p {sub['file_path']} && cat > {sub['file_path']}/config.yaml"],
-        input=yaml_content, capture_output=True, text=True
-    )
-    if r.returncode == 0:
-        print(f"✅ Uploaded to {sub['ssh_host']}:{sub['file_path']}/config.yaml")
-        print(f"📋 https://{sub['domain']}/{sub['url_path']}/config.yaml")
-    else:
-        print(f"❌ Upload failed: {r.stderr}")
-        return
-
-    # Mirror rule sets onto our own origin (see mirror_rulesets). Clients now
-    # fetch rulesets from the same reachable host as the config, not jsdelivr.
     print("Mirroring rule sets...")
-    mirror_rulesets(sub)
+    if not mirror_rulesets(sub):
+        rp_dir = f"{sub['file_path']}/ruleset"
+        present = " && ".join(f"test -s {rp_dir}/{fn}" for _, fn, _ in _mirror_entries())
+        if subprocess.run(["ssh", sub["ssh_host"], present]).returncode != 0:
+            print("❌ Rule sets missing on the host — not publishing configs that would 404.")
+            return
+        print("  Previous rule sets still in place — publishing anyway.")
+
+    # Upload each file to a temp name and mv it into place: a client fetching
+    # mid-upload must see the old file or the new one, never a truncated mix.
+    base_url = f"https://{sub['domain']}/{sub['url_path']}"
+    for fname, content in outputs.items():
+        dst = f"{sub['file_path']}/{fname}"
+        r = subprocess.run(
+            ["ssh", sub["ssh_host"], f"mkdir -p {sub['file_path']} && cat > {dst}.tmp && mv {dst}.tmp {dst}"],
+            input=content, capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print(f"❌ Upload of {fname} failed: {r.stderr}")
+            return
+        print(f"✅ Uploaded {sub['ssh_host']}:{dst}")
+
+    print(f"📋 Clash:       {base_url}/{CLASH_FILE}")
+    print(f"📋 Shadowrocket 节点订阅: {base_url}/{SR_NODES_FILE}")
+    print(f"📋 Shadowrocket 配置:     {base_url}/{SR_CONF_FILE}")
 
 # ── Main ─────────────────────────────────────────────────────
 

@@ -64,6 +64,15 @@ SSH connect → scan occupied ports → pick available port
 
 The generated Clash YAML is uploaded to one of your VPS nodes via SSH. You serve it with nginx + SSL (e.g., behind Cloudflare). Users import the URL in Clash Verge Rev / Mihomo and get all nodes + routing rules.
 
+`sync` also publishes a Shadowrocket pair next to it (Shadowrocket can't read mihomo's `.mrs` rule sets):
+
+| File | Import in Shadowrocket as |
+|---|---|
+| `shadowrocket.txt` | Subscription (home screen) — base64 `vless://` links |
+| `shadowrocket.conf` | Config (Config tab → remote URL) — rules + groups that collect nodes by name regex |
+
+Rule sets for both clients are mirrored onto the same host, so nothing is fetched from GitHub/jsDelivr on the device.
+
 ### Proxy Groups
 
 | Group | Purpose |
