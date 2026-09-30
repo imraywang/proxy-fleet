@@ -10,6 +10,7 @@ Usage:
     python3 fleet.py deploy <host> --name "Tokyo" --emoji "🇯🇵"
     python3 fleet.py remove <host>                     # Remove a node
     python3 fleet.py sync                              # Regenerate & upload subscription
+    python3 fleet.py upgrade <host> [host...]          # Upgrade 3x-ui + pin Xray core
 """
 
 import json, subprocess, sys, os, secrets, re, textwrap, time, base64, urllib.parse
@@ -80,10 +81,25 @@ SR_CONF_FILE = "shadowrocket.conf"   # rules + groups (Shadowrocket "config")
 SR_NODES_FILE = "shadowrocket.txt"   # base64 vless:// list (Shadowrocket "subscription")
 
 # Pin the 3x-ui version the whole fleet runs on. The panel API client below
-# (login → session cookie → /panel/api/inbounds) handles both the 2.8.x API
-# and the CSRF-token login that 3.4.x added — see REMOTE_INBOUND_SCRIPT. When
-# bumping, re-verify that login flow still holds against the new release.
-XUI_VERSION = "v3.4.1"
+# (login → session cookie → /panel/api/inbounds) handles the 2.8.x API and the
+# CSRF-token login that 3.4.x added — see REMOTE_INBOUND_SCRIPT. When bumping,
+# re-verify that login flow still holds against the new release.
+XUI_VERSION = "v3.8.5"
+
+# Pin the Xray core separately from the panel (3x-ui v3.8.x bundles 26.9.9).
+# From Xray v26.9.8 the REALITY server rejects any ClientHello without an
+# X25519MLKEM768 key share, and Shadowrocket doesn't send one — so a newer
+# core locks Shadowrocket out of the node. mihomo only passes with
+# `support-x25519mlkem768: true` (set in generate_subscription). v26.7.28 is
+# the newest core without that check and accepts both clients. 3x-ui v3.8.5
+# accepts cores >= v26.6.27. Only raise this once Shadowrocket sends MLKEM —
+# probe a node with it before rolling out.
+#
+# v26.7.x also defaults an empty REALITY minClientVer to 26.3.27, which
+# rejects mihomo (it reports a hardcoded 1.8.2). Existing inbounds carry an
+# explicit minClientVer for that; new ones created by REMOTE_INBOUND_SCRIPT
+# don't yet — set it on the inbound after deploy.
+XRAY_VERSION = "v26.7.28"
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -200,13 +216,19 @@ def install_3xui(host, creds):
         print(f"  [{host}] 3x-ui already installed, skipping install")
     else:
         print(f"  [{host}] Installing 3x-ui {XUI_VERSION} (this may take 1-2 minutes)...")
-        ssh(host,
-            f"echo 'y' | bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/{XUI_VERSION}/install.sh) {XUI_VERSION}",
-            timeout=180, check=False)
+        # ssh without a tty puts install.sh (3.8.x) in non-interactive mode:
+        # every prompt comes from these env vars. No SSL (the panel is bound
+        # to loopback below) and no fail2ban (we don't use IP limits).
+        ssh(host, (
+            f"XUI_USERNAME={creds['username']} XUI_PASSWORD={creds['password']} "
+            f"XUI_PANEL_PORT={creds['panel_port']} XUI_SSL_MODE=none XUI_ENABLE_FAIL2BAN=false "
+            f"bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/{XUI_VERSION}/install.sh) {XUI_VERSION}"
+        ), timeout=300, check=False)
         print(f"  [{host}] Install complete")
 
     # Always reset credentials to ensure consistency
     harden_panel(host, creds)
+    pin_xray(host, creds)
 
 
 def harden_panel(host, creds):
@@ -237,6 +259,63 @@ def harden_panel(host, creds):
     """))
     ssh(host, "systemctl restart x-ui")
     print(f"  [{host}] Panel on 127.0.0.1:{creds['panel_port']} only, built-in sub server off")
+
+REMOTE_PANEL_POST_SCRIPT = textwrap.dedent(r'''
+import json, sys, re, urllib.request, urllib.parse, http.cookiejar
+panel_port, username, password, path = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+panel = f"http://localhost:{panel_port}"
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+home = opener.open(f"{panel}/").read().decode("utf-8", "replace")
+m = re.search(r'name="csrf-token"\s+content="([^"]+)"', home)
+h = {"X-CSRF-Token": m.group(1)} if m else {}
+opener.open(urllib.request.Request(f"{panel}/login",
+    urllib.parse.urlencode({"username": username, "password": password}).encode(), h))
+print(opener.open(urllib.request.Request(f"{panel}{path}", b"", h), timeout=170).read().decode())
+''')
+
+
+def xray_version(host):
+    out = ssh(host, "$(ls /usr/local/x-ui/bin/xray-linux-* | head -1) version | head -1", check=False)
+    return "v" + out.split()[1] if out.startswith("Xray ") else ""
+
+
+def pin_xray(host, creds):
+    """Switch the node's Xray core to XRAY_VERSION via the panel (see there)."""
+    if xray_version(host) == XRAY_VERSION:
+        return
+    args = f"{creds['panel_port']} {creds['username']} {creds['password']} /panel/api/server/installXray/{XRAY_VERSION}"
+    res = json.loads(ssh_script(host, REMOTE_PANEL_POST_SCRIPT, args, timeout=200))
+    if not res.get("success") or xray_version(host) != XRAY_VERSION:
+        raise RuntimeError(f"[{host}] Xray pin to {XRAY_VERSION} failed: {res.get('msg')}")
+    print(f"  [{host}] Xray core pinned to {XRAY_VERSION}")
+
+
+def upgrade_3xui(host, creds):
+    """Upgrade an existing node to XUI_VERSION, keeping our panel settings.
+
+    update.sh (3.8.x) is interactive and opinionated: it replaces a short
+    webBasePath with a random one (breaks our root-path API client) and,
+    with no SSL cert, defaults to issuing a Let's Encrypt IP cert (needs
+    port 80). Feed it "4" (skip SSL) + "y" (bind to 127.0.0.1), then
+    re-apply harden_panel (restores webBasePath "/") and pin the Xray core.
+    The DB and binaries are backed up under /root first for rollback.
+    """
+    tag = XUI_VERSION.lstrip("v")
+    ssh(host, (
+        f"cp -a /etc/x-ui/x-ui.db /root/x-ui.db.bak-pre-{tag} && "
+        f"tar czf /root/x-ui-bin-pre-{tag}.tgz -C /usr/local x-ui"
+    ), timeout=120)
+    ssh(host, (
+        f"curl -fsSL --max-time 60 https://raw.githubusercontent.com/MHSanaei/3x-ui/{XUI_VERSION}/update.sh -o /root/xui-update.sh && "
+        f"printf '4\\ny\\n' | XUI_UPDATE_TAG={XUI_VERSION} XUI_ENABLE_FAIL2BAN=false "
+        f"bash /root/xui-update.sh > /root/xui-update-{tag}.log 2>&1"
+    ), timeout=400)
+    got = ssh(host, "/usr/local/x-ui/x-ui -v", check=False)
+    if got != tag:
+        raise RuntimeError(f"[{host}] upgrade failed (x-ui -v: {got!r}); see /root/xui-update-{tag}.log")
+    print(f"  [{host}] 3x-ui upgraded to {XUI_VERSION}")
+    harden_panel(host, creds)
+    pin_xray(host, creds)
 
 # ── VLESS+Reality Inbound ────────────────────────────────────
 
@@ -1248,6 +1327,22 @@ def cmd_sync():
     print(f"📋 Shadowrocket 节点订阅: {base_url}/{SR_NODES_FILE}")
     print(f"📋 Shadowrocket 配置:     {base_url}/{SR_CONF_FILE}")
 
+def cmd_upgrade(hosts):
+    """Upgrade nodes one at a time; stop at the first one that fails its check."""
+    cfg = load_config()
+    by_host = {n["ssh_host"]: n for n in cfg["nodes"]}
+    for host in hosts:
+        node = by_host.get(host)
+        if not node:
+            print(f"  [{host}] not in config.json, skipping")
+            continue
+        print(f"Upgrading {host}...")
+        upgrade_3xui(host, cfg["credentials"])
+        if not verify_port(node["server"], node["port"]):
+            print(f"❌ [{host}] {node['server']}:{node['port']} not answering after upgrade — stopping here.")
+            return
+        print(f"✅ [{host}] {XUI_VERSION} / Xray {XRAY_VERSION}, port {node['port']} answering")
+
 # ── Main ─────────────────────────────────────────────────────
 
 def main():
@@ -1292,6 +1387,11 @@ def main():
         cmd_remove(sys.argv[2])
     elif cmd == "sync":
         cmd_sync()
+    elif cmd == "upgrade":
+        if len(sys.argv) < 3:
+            print("Usage: fleet.py upgrade <host> [host...]")
+            sys.exit(1)
+        cmd_upgrade(sys.argv[2:])
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)

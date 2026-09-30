@@ -31,6 +31,7 @@ python3 scripts/fleet.py deploy <host> [--name X --emoji 🇯🇵]  # One-click 
 python3 scripts/fleet.py deploy <host> --nat 10000-10009   # NAT machine
 python3 scripts/fleet.py remove <host>                     # Remove from subscription
 python3 scripts/fleet.py sync                              # Regenerate subscription YAML
+python3 scripts/fleet.py upgrade <host> [host...]          # Upgrade 3x-ui, keep settings, pin Xray
 ```
 
 ## When to Use Each Command
@@ -87,6 +88,11 @@ These matter when debugging or extending the skill:
 - **3x-ui API**: `POST /login` → session cookie → `/panel/api/inbounds/{add,update,del,list}`.
 - **Reality returns HTTP 400** to non-VLESS clients — the connectivity check treats 400 as alive.
 - **Port conflicts** are the #1 deploy failure cause — the script scans ports before configuring.
+- **Xray is pinned below the panel's bundled core** (`XRAY_VERSION`): Xray >= v26.9.8 rejects
+  REALITY ClientHellos without X25519MLKEM768, which locks Shadowrocket out. Clash needs
+  `support-x25519mlkem768: true` (generated). Don't raise the pin without probing Shadowrocket.
+- **REALITY minClientVer**: Xray v26.7.x defaults an empty value to 26.3.27; mihomo reports
+  1.8.2 and would be refused. Existing inbounds carry an explicit value.
 - **sync order**: rule sets are mirrored *before* configs are published, and every file is
   written to `.tmp` then `mv`'d — a config must never reference a ruleset the host can't serve.
 - **Ruleset mirror cron**: `sync` installs `/etc/cron.d/proxy-fleet-mirror` on the subscription
