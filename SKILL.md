@@ -81,5 +81,8 @@ These matter when debugging or extending the skill:
 - **3x-ui API**: `POST /login` → session cookie → `/panel/api/inbounds/{add,update,del,list}`.
 - **Reality returns HTTP 400** to non-VLESS clients — the connectivity check treats 400 as alive.
 - **Port conflicts** are the #1 deploy failure cause — the script scans ports before configuring.
+- **Ruleset mirror cron**: `sync` installs `/etc/cron.d/proxy-fleet-mirror` on the subscription
+  host (daily 04:17, script `/usr/local/sbin/proxy-fleet-mirror.sh`). The script validates the
+  zstd magic before replacing any live `.mrs`, so a bad upstream day only means a stale mirror.
 - **xray binary** path is auto-detected via glob (`/usr/local/x-ui/bin/xray-linux-*`), works
   on both amd64 and arm64.
