@@ -697,6 +697,12 @@ def generate_subscription(cfg, node_details):
         lines.append(f'    reality-opts:')
         lines.append(f'      public-key: {p["reality-opts"]["public-key"]}')
         lines.append(f'      short-id: {p["reality-opts"]["short-id"]}')
+        # mihomo strips X25519MLKEM768 from its ClientHello unless told
+        # otherwise, and REALITY servers from Xray v26.9.x reject a Chrome
+        # hello without it ("REALITY authentication failed"). Older servers
+        # (26.6.22) accept it too, so it's safe fleet-wide — and it makes the
+        # fingerprint match what a current Chrome actually sends.
+        lines.append(f'      support-x25519mlkem768: true')
         lines.append(f'    client-fingerprint: {p["client-fingerprint"]}')
         lines.append("")
 
