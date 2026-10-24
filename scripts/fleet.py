@@ -193,7 +193,8 @@ def pick_port(used_ports, preferred_ports, nat_range=None):
 
 def configure_firewall(host, ports):
     """Detect firewall type and open ports."""
-    has_ufw = "active" in ssh(host, "ufw status 2>/dev/null || echo inactive", check=False)
+    # "inactive" contains "active", so match ufw's exact status line
+    has_ufw = "Status: active" in ssh(host, "ufw status 2>/dev/null || echo inactive", check=False)
     if has_ufw:
         for p in ports:
             ssh(host, f"ufw allow {p}/tcp 2>/dev/null", check=False)
